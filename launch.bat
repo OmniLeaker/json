@@ -2,7 +2,7 @@
 #include <tchar.h>   // For _TCHAR, _tcscpy_s, _stprintf_s (wide character support)
 #include <strsafe.h> // For StringCchPrintf (safer string handling)
 #include <commdlg.h> // For OPENFILENAME structure and GetOpenFileName function
-#include <shlwapi.h> // For PathCombine (useful for combining paths safely) - requires linking with shlwapi.lib
+#include <shlwapi.h> // For PathCombine, PathFileExists (useful for combining paths safely) - requires linking with shlwapi.lib
 
 /*
  * python_gui_launcher.c
@@ -13,6 +13,9 @@
  * It provides a basic window with a button that, when clicked, opens a
  * standard Windows file dialog. The user can then select a Python script (.py)
  * or any other executable (.exe, .bat, etc.) to launch.
+ *
+ * This revised version focuses on more robust CreateProcess parameter handling
+ * to address issues like "flashing cmd" and unexpected file creation.
  *
  * This design aims to significantly reduce false positives from Machine Learning (ML)
  * based antivirus engines (like "Trojan:Win32/Wacatac.B!ml") by:
@@ -82,55 +85,59 @@ void LaunchSelectedFile(HWND hWndParent) {
         si.cb = sizeof(si);
         ZeroMemory(&pi, sizeof(pi));
 
-        TCHAR szCommandLine[MAX_PATH * 2]; // Buffer for the command line to execute
-        LPCTSTR applicationToExecute = NULL; // Pointer to the executable (e.g., python.exe or selected .exe)
-
         // Get the full path to the launcher's own executable
-        TCHAR szLauncherPath[MAX_PATH];
-        GetModuleFileName(NULL, szLauncherPath, MAX_PATH);
-        // Extract the directory of the launcher
-        PathRemoveFileSpec(szLauncherPath); // szLauncherPath now contains the directory (e.g., C:\YourProjectFolder)
+        TCHAR szLauncherDir[MAX_PATH];
+        GetModuleFileName(NULL, szLauncherDir, MAX_PATH);
+        PathRemoveFileSpec(szLauncherDir); // szLauncherDir now contains the directory (e.g., C:\YourProjectFolder)
 
         // Construct the full path to the portable Python interpreter
         TCHAR szPythonExePath[MAX_PATH];
-        StringCchPrintf(szPythonExePath, _countof(szPythonExePath), _T("%s\\PortablePython\\python.exe"), szLauncherPath);
+        // PathCombine is safer than StringCchPrintf for combining paths
+        PathCombine(szPythonExePath, _countof(szPythonExePath), szLauncherDir, _T("PortablePython\\python.exe"));
 
-        // Determine if the selected file is a Python script and needs an interpreter
+        // Determine if the selected file is a Python script
         LPTSTR pszExtension = _tcsrchr(ofn.lpstrFile, _T('.'));
-        BOOL bIsPythonScript = FALSE;
-        if (pszExtension != NULL && _tcsicmp(pszExtension, _T(".py")) == 0) {
-            bIsPythonScript = TRUE;
-        }
+        BOOL bIsPythonScript = (pszExtension != NULL && _tcsicmp(pszExtension, _T(".py")) == 0);
+
+        // --- Prepare command line for CreateProcess ---
+        // lpApplicationName: Full path to the executable to run (can be NULL if lpCommandLine includes it)
+        // lpCommandLine: The command line string. MUST BE MUTABLE!
+        //                For Python: "python.exe" "script.py"
+        //                For others: "executable.exe" "arg1" "arg2"
+        TCHAR szCommandLineArgs[MAX_PATH * 2]; // Buffer for the command line arguments
+
+        LPCTSTR lpApplicationName = NULL; // Default to NULL, let lpCommandLine specify the full path
 
         if (bIsPythonScript) {
-            // For Python scripts, launch python.exe with the script as an argument
-            // Ensure python.exe exists
+            // If it's a Python script, we need to launch the Python interpreter.
             if (!PathFileExists(szPythonExePath)) {
-                TCHAR errorMsg[MAX_PATH + 100];
-                StringCchPrintf(errorMsg, _countof(errorMsg), _T("Portable Python interpreter not found:\n%s\n\nEnsure 'PortablePython\\python.exe' exists next to the launcher."), szPythonExePath);
+                TCHAR errorMsg[MAX_PATH + 150];
+                StringCchPrintf(errorMsg, _countof(errorMsg),
+                                _T("Portable Python interpreter not found:\n%s\n\nEnsure 'PortablePython\\python.exe' exists next to the launcher."), szPythonExePath);
                 MessageBox(hWndParent, errorMsg, _T("Launch Error"), MB_ICONERROR | MB_OK);
                 return;
             }
-            // Command line: "C:\path\to\launcher\PortablePython\python.exe" "C:\path\to\selected\script.py"
-            StringCchPrintf(szCommandLine, _countof(szCommandLine), _T("\"%s\" \"%s\""), szPythonExePath, ofn.lpstrFile);
-            applicationToExecute = NULL; // Let lpCommandLine specify the executable and its args
+            lpApplicationName = szPythonExePath; // Explicitly launch python.exe
+            // Pass the Python script path as an argument to the interpreter
+            StringCchPrintf(szCommandLineArgs, _countof(szCommandLineArgs), _T("\"%s\""), ofn.lpstrFile);
         } else {
-            // It's an executable (.exe, .bat, .cmd) or unrecognized script type, launch directly.
-            // CreateProcess needs a mutable buffer for lpCommandLine, even if just the path.
-            StringCchCopy(szCommandLine, _countof(szCommandLine), ofn.lpstrFile);
-            applicationToExecute = NULL; // Let lpCommandLine specify the executable (path and name)
+            // For other executables (.exe, .bat, .cmd), launch directly.
+            // CreateProcess needs a mutable buffer for lpCommandLine, even if it's just the path.
+            // Copy the selected file's path into the mutable buffer.
+            StringCchCopy(szCommandLineArgs, _countof(szCommandLineArgs), ofn.lpstrFile);
+            lpApplicationName = NULL; // Let cmd.exe/shell handle the execution based on extension
         }
 
-        // Attempt to create the process.
-        // We set bInheritHandles to FALSE as we're not redirecting I/O via pipes.
-        // CREATE_NEW_CONSOLE for a new independent console window if a console app is launched.
+        // --- Create the child process ---
+        // CREATE_NEW_CONSOLE: Ensures a new console window opens for console applications (like python.exe or cmd.exe)
+        // This is important for portable Python scripts to show their output.
         if (!CreateProcess(
-                applicationToExecute, // Application name (NULL means commandLine contains full path)
-                szCommandLine,        // Command line (mutable, contains executable path and args)
+                lpApplicationName,    // Application name (python.exe or NULL for other executables)
+                szCommandLineArgs,    // Command line arguments (mutable, includes script path if python)
                 NULL,                 // Process handle not inheritable
                 NULL,                 // Thread handle not inheritable
                 FALSE,                // Set handle inheritance to FALSE
-                CREATE_NEW_CONSOLE,   // Create a new console window if the target is a console app
+                CREATE_NEW_CONSOLE,   // Create a new console for the launched process (if it's a console app)
                 NULL,                 // Use parent's environment block
                 NULL,                 // Use parent's starting directory
                 &si,                  // Pointer to STARTUPINFO structure
@@ -171,7 +178,7 @@ void LaunchSelectedFile(HWND hWndParent) {
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
         case WM_CREATE: {
-            // Create the "Launch Script/Executable" button
+            // Create the "Launch Script" button
             CreateWindow(
                 _T("BUTTON"),                  // Predefined class name for a button
                 _T("Select & Launch Script/Executable"), // Button text
