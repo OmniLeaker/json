@@ -1,8 +1,6 @@
 @echo off
 REM This batch script launches a new instance of the Command Prompt (cmd.exe).
 
-REM The 'start' command is used to launch programs or commands in a new window.
-REM cmd.exe: The executable to launch.
 start "" cmd.exe
 
 REM Optionally, you can add a pause if you want the launcher's own console window
